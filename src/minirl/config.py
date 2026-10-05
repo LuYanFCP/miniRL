@@ -86,3 +86,24 @@ class SFTConfig(TrainerConfig):
         super().__post_init__()
         for name in ("num_epochs", "batch_size"):
             _positive_integer(name, getattr(self, name))
+
+
+@dataclass
+class RLConfig(TrainerConfig):
+    """One optimizer update per minibatch, with a constant learning rate.
+
+    log_steps counts optimizer updates; save_steps counts complete rollouts.
+    """
+
+    num_iterations: int = 100
+    update_epochs: int = 2
+    minibatch_size: int = 4
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for name in ("num_iterations", "update_epochs", "minibatch_size"):
+            _positive_integer(name, getattr(self, name))
+        if self.gradient_accumulation_steps != 1:
+            raise ValueError("RL gradient_accumulation_steps must be 1")
+        if self.warmup_steps != 0:
+            raise ValueError("RL warmup_steps must be 0; no LR schedule is configured")

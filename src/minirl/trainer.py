@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence, Sized
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 import torch
@@ -23,7 +23,7 @@ from .algorithm import SFT
 from .algorithm.base import Algorithm, TensorBatch
 from .common import DataCollector, MetricValue
 from .common.training_metrics import TrainingMetrics
-from .config import MuonConfig, SFTConfig, TrainerConfig
+from .config import MuonConfig, RLConfig, SFTConfig, TrainerConfig
 from .optim import build_optimizer
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,13 @@ def _resolve_device(requested: str | None) -> torch.device:
             f"CUDA device index {index} is outside the {count} visible devices"
         )
     return torch.device("cuda", index)
+
+
+@runtime_checkable
+class _Stateful(Protocol):
+    def state_dict(self) -> dict[str, Any]: ...
+
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
 class _ResumableBatchSampler(Sampler[list[int]]):
@@ -516,5 +523,134 @@ class SFTTrainer[SampleT](Trainer):
                     ):
                         self.save_checkpoint()
                     started = self._begin_update()
+
+        self.save_checkpoint()
+
+
+class RLTrainer[PromptT](Trainer):
+    """Prepare a rollout once, update on shuffled minibatches, then checkpoint.
+
+    Rollouts supply detached policy samples and their behavior log probabilities.
+    A callable with state_dict/load_state_dict also restores its sampling cursor.
+    Checkpoints resume at completed rollout boundaries, including RNG state.
+    """
+
+    config: RLConfig
+
+    def __init__(
+        self,
+        config: RLConfig,
+        algorithm: Algorithm,
+        models: Mapping[str, torch.nn.Module],
+        rollout_fn: Callable[[list[PromptT]], TensorBatch],
+        prompts: list[PromptT] | None = None,
+        *,
+        collector: DataCollector | None = None,
+    ) -> None:
+        super().__init__(config, collector=collector)
+        self.algorithm = algorithm
+        self.rollout_fn = rollout_fn
+        self.prompts: list[PromptT] = prompts or []
+        self.iteration = 0
+
+        for name in algorithm.MODEL_NAMES:
+            self.register_model(
+                name, models[name], trainable=name in algorithm.TRAINABLE_MODELS
+            )
+
+    def _minibatches(self, batch: TensorBatch, size: int) -> Iterator[TensorBatch]:
+        B = batch["input_ids"].shape[0]
+        if B == 0 or any(
+            value.ndim == 0 or value.shape[0] != B for value in batch.values()
+        ):
+            raise ValueError(
+                "Rollout fields must have the same non-empty batch dimension"
+            )
+        idx = torch.randperm(B, device=self.device)
+        for start in range(0, B, size):
+            sel = idx[start : start + size]
+            yield {k: v[sel] for k, v in batch.items()}
+
+    def _loop_state_dict(self) -> dict[str, Any]:
+        return {
+            "iteration": self.iteration,
+            "algorithm": self.algorithm.state_dict(),
+            "rollout": self.rollout_fn.state_dict()
+            if isinstance(self.rollout_fn, _Stateful)
+            else None,
+        }
+
+    def _load_loop_state_dict(self, state: dict[str, Any]) -> None:
+        if not 0 <= state["iteration"] <= self.config.num_iterations:
+            raise ValueError("Invalid checkpoint iteration")
+        self.iteration = state["iteration"]
+        self.algorithm.load_state_dict(state["algorithm"])
+        if state["rollout"] is not None:
+            if not isinstance(self.rollout_fn, _Stateful):
+                raise ValueError("Checkpoint requires a stateful rollout callable")
+            self.rollout_fn.load_state_dict(state["rollout"])
+
+    def _train(self) -> None:
+        for name, model in self.models.items():
+            model.train(name in self.algorithm.TRAINABLE_MODELS)
+        for optimizer in self.optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
+
+        while self.iteration < self.config.num_iterations:
+            it = self.iteration
+            self._checkpoint_ready = False
+            with torch.no_grad(), self.amp():
+                batch = self.rollout_fn(self.prompts)
+                batch = {k: v.detach().to(self.device) for k, v in batch.items()}
+                batch = self.algorithm.prepare(self.models, batch)
+                # A returned parameter/view must not change as optimizers update the models.
+                batch = {k: v.detach().clone() for k, v in batch.items()}
+            rollout_metrics = {
+                f"rollout/{key}": value
+                for key, value in self.algorithm.rollout_metrics().items()
+            }
+
+            for _ in range(self.config.update_epochs):
+                for mb in self._minibatches(batch, self.config.minibatch_size):
+                    for optimizer in self.optimizers.values():
+                        optimizer.zero_grad(set_to_none=True)
+                    with self.amp():
+                        losses = self.algorithm.compute_losses(self.models, mb)
+                    if not losses or set(losses) - self.optimizers.keys():
+                        raise ValueError(
+                            "RL losses must be a non-empty mapping keyed by registered optimizer names"
+                        )
+                    if any(
+                        loss.numel() != 1 or not loss.requires_grad
+                        for loss in losses.values()
+                    ):
+                        raise ValueError(
+                            "RL losses must be differentiable scalar tensors"
+                        )
+                    # Backpropagate all roots together before any parameter is mutated.
+                    torch.autograd.backward(tuple(losses.values()))
+                    for name in losses:
+                        self.grad_step(name)
+                    self.global_step += 1
+
+                    if self.global_step % self.config.log_steps == 0:
+                        self.log(
+                            {
+                                "iter": it,
+                                **rollout_metrics,
+                                **losses,
+                                **{
+                                    f"{name}/{key}": value
+                                    for name in losses
+                                    for key, value in self._grad_metrics[name].items()
+                                },
+                            }
+                        )
+
+            self.algorithm.on_iteration_end(self.models, it)
+            self.iteration += 1
+            self._checkpoint_ready = True
+            if self.config.save_steps > 0 and (it + 1) % self.config.save_steps == 0:
+                self.save_checkpoint()
 
         self.save_checkpoint()
