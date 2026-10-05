@@ -10,7 +10,13 @@ import torch
 import torch.nn.functional as F
 
 from .base import Algorithm, Losses, ModelMap, TensorBatch
-from .functional import binary_mask, check_response_spans, evaluating, fixed_targets
+from .functional import (
+    binary_mask,
+    check_response_spans,
+    check_shape,
+    evaluating,
+    fixed_targets,
+)
 
 
 @dataclass(frozen=True)
@@ -66,9 +72,21 @@ class GRPO(Algorithm):
         return response
 
     @staticmethod
-    def _policy_logits(model, input_ids, attention_mask):
+    def _policy_output(model, input_ids, attention_mask):
         with evaluating(model):
-            output = model(input_ids=input_ids, attention_mask=attention_mask)
+            return model(input_ids=input_ids, attention_mask=attention_mask)
+
+    def per_token_logprobs(
+        self, model, input_ids, attention_mask, *, response_mask=None
+    ):
+        """Score the policy in eval mode; support chunked token-logprob adapters."""
+        output = self._policy_output(model, input_ids, attention_mask)
+        scores = getattr(output, "token_logprobs", None)
+        if scores is not None:
+            check_shape("token_logprobs", scores, input_ids)
+            if not scores.is_floating_point():
+                raise ValueError("token_logprobs must be floating-point")
+            return scores.float()
         logits = getattr(output, "logits", None)
         if (
             not isinstance(logits, torch.Tensor)
@@ -79,11 +97,15 @@ class GRPO(Algorithm):
             raise ValueError(
                 "The actor/reference must return floating logits [B, T, V]"
             )
-        return logits
-
-    def per_token_logprobs(self, model, input_ids, attention_mask):
-        """Score the unmodified policy in eval mode, restoring all module modes."""
-        logits = self._policy_logits(model, input_ids, attention_mask)
+        if response_mask is not None:
+            # Mask before softmax so unused NaNs never enter the autograd graph.
+            values = F.log_softmax(logits[:, :-1][response_mask[:, 1:]].float(), -1)
+            selected = values.gather(
+                -1, input_ids[response_mask].long().unsqueeze(-1)
+            ).squeeze(-1)
+            return torch.zeros_like(input_ids, dtype=torch.float32).masked_scatter(
+                response_mask, selected
+            )
         values = F.log_softmax(logits[:, :-1].float(), dim=-1)
         selected = values.gather(-1, input_ids[:, 1:].long().unsqueeze(-1)).squeeze(-1)
         return F.pad(selected, (1, 0))
@@ -159,10 +181,12 @@ class GRPO(Algorithm):
         ids = batch["input_ids"]
         old = fixed_targets("old_logprobs", batch["old_logprobs"], mask)[mask]
         advantages = fixed_targets("advantages", batch["advantages"], mask)[mask]
-        logits = self._policy_logits(models["actor"], ids, batch["attention_mask"])
-        # Select active predictors first: masked NaNs must never enter reductions.
-        distribution = F.log_softmax(logits[:, :-1][mask[:, 1:]].float(), dim=-1)
-        current = distribution.gather(-1, ids[mask].long().unsqueeze(-1)).squeeze(-1)
+        current = self.per_token_logprobs(
+            models["actor"],
+            ids,
+            batch["attention_mask"],
+            response_mask=mask,
+        )[mask]
         ratios = (current - old).exp()
         if not torch.isfinite(ratios).all():
             raise ValueError("GRPO probability ratios must be finite")

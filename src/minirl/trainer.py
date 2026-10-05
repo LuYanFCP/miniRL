@@ -8,7 +8,7 @@ import random
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence, Sized
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
@@ -590,6 +590,50 @@ class RLTrainer[PromptT](Trainer):
                 raise ValueError("Checkpoint requires a stateful rollout callable")
             self.rollout_fn.load_state_dict(state["rollout"])
 
+    def _update_minibatch(self, batch: TensorBatch) -> dict[str, torch.Tensor]:
+        """Accumulate sequence-mean losses, including an uneven final microbatch."""
+        size = batch["input_ids"].shape[0]
+        micro_size = self.config.microbatch_size or size
+        totals: dict[str, torch.Tensor] = {}
+        for optimizer in self.optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
+        for start in range(0, size, micro_size):
+            stop = min(start + micro_size, size)
+            micro = {key: value[start:stop] for key, value in batch.items()}
+            with ExitStack() as contexts:
+                if stop < size:
+                    for name in self.algorithm.TRAINABLE_MODELS:
+                        no_sync = getattr(self.models[name], "no_sync", None)
+                        if no_sync is not None:
+                            contexts.enter_context(no_sync())
+                with self.amp():
+                    losses = self.algorithm.compute_losses(self.models, micro)
+                if not losses or set(losses) - self.optimizers.keys():
+                    raise ValueError(
+                        "RL losses must be keyed by registered optimizer names"
+                    )
+                if totals and losses.keys() != totals.keys():
+                    raise ValueError(
+                        "RL loss roles must remain fixed within a minibatch"
+                    )
+                if any(
+                    loss.numel() != 1 or not loss.requires_grad
+                    for loss in losses.values()
+                ):
+                    raise ValueError("RL losses must be differentiable scalar tensors")
+                fraction = (stop - start) / size
+                torch.autograd.backward(
+                    tuple(loss * fraction for loss in losses.values())
+                )
+                for name, loss in losses.items():
+                    totals[name] = totals.get(name, 0) + loss.detach() * fraction
+        for name in totals:
+            self.grad_step(name)
+        return totals
+
+    def _after_iteration(self) -> None:
+        """Optional evaluation hook at a completed, checkpointable rollout boundary."""
+
     def _train(self) -> None:
         for name, model in self.models.items():
             model.train(name in self.algorithm.TRAINABLE_MODELS)
@@ -612,25 +656,7 @@ class RLTrainer[PromptT](Trainer):
 
             for _ in range(self.config.update_epochs):
                 for mb in self._minibatches(batch, self.config.minibatch_size):
-                    for optimizer in self.optimizers.values():
-                        optimizer.zero_grad(set_to_none=True)
-                    with self.amp():
-                        losses = self.algorithm.compute_losses(self.models, mb)
-                    if not losses or set(losses) - self.optimizers.keys():
-                        raise ValueError(
-                            "RL losses must be a non-empty mapping keyed by registered optimizer names"
-                        )
-                    if any(
-                        loss.numel() != 1 or not loss.requires_grad
-                        for loss in losses.values()
-                    ):
-                        raise ValueError(
-                            "RL losses must be differentiable scalar tensors"
-                        )
-                    # Backpropagate all roots together before any parameter is mutated.
-                    torch.autograd.backward(tuple(losses.values()))
-                    for name in losses:
-                        self.grad_step(name)
+                    losses = self._update_minibatch(mb)
                     self.global_step += 1
 
                     if self.global_step % self.config.log_steps == 0:
@@ -650,6 +676,7 @@ class RLTrainer[PromptT](Trainer):
             self.algorithm.on_iteration_end(self.models, it)
             self.iteration += 1
             self._checkpoint_ready = True
+            self._after_iteration()
             if self.config.save_steps > 0 and (it + 1) % self.config.save_steps == 0:
                 self.save_checkpoint()
 

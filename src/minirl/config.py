@@ -98,11 +98,14 @@ class RLConfig(TrainerConfig):
     num_iterations: int = 100
     update_epochs: int = 2
     minibatch_size: int = 4
+    microbatch_size: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for name in ("num_iterations", "update_epochs", "minibatch_size"):
             _positive_integer(name, getattr(self, name))
+        if self.microbatch_size is not None:
+            _positive_integer("microbatch_size", self.microbatch_size)
         if self.gradient_accumulation_steps != 1:
             raise ValueError("RL gradient_accumulation_steps must be 1")
         if self.warmup_steps != 0:
