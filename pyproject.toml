@@ -1,0 +1,35 @@
+[project]
+name = "minirl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Yan Lu", email = "luyan@nvidia.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "huggingface-hub>=1.0.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0.2",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+    "transformers>=5.18.0",
+]
+
+[project.optional-dependencies]
+tensorboard = ["tensorboard>=2.17.0"]
+opentelemetry = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+assessment = [
+    "math-verify==0.9.0",
+]
+
+[project.scripts]
+minirl = "minirl:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"

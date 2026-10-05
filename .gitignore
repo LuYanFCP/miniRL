@@ -1,0 +1,69 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# === Distribution / packaging ===
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheelhouse/
+pip-wheel-metadata/
+
+# === Virtual environments & uv ===
+.venv/
+venv/
+env/
+ENV/
+.uv/
+
+# === Test & coverage ===
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# === Machine learning / PyTorch artifacts ===
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.plan
+runs/
+outputs/
+checkpoints/
+.runtime/
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === IDEs & editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# === Misc ===
+*.log
+.env
+.env.*
+!.env.example
