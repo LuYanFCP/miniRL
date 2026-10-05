@@ -1,5 +1,7 @@
 from .collector import (
+    CSVSink,
     DataCollector,
+    JSONLSink,
     LoggingSink,
     MetricRecord,
     MetricSink,
@@ -12,10 +14,12 @@ from .evaluation import EvaluationContext, EvaluationPlugin
 from .plugins import PluginConfig
 
 __all__ = [
+    "CSVSink",
     "ConfigError",
     "DataCollector",
     "EvaluationContext",
     "EvaluationPlugin",
+    "JSONLSink",
     "LoggingSink",
     "MetricRecord",
     "MetricSink",

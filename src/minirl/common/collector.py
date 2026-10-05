@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import re
 import time
@@ -197,6 +199,73 @@ class LoggingSink:
             for handler in self.logger.handlers[:]:
                 handler.close()
                 self.logger.removeHandler(handler)
+
+
+class JSONLSink:
+    """Append complete metric records and flush each write for live monitoring."""
+
+    def __init__(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = path.open("a", encoding="utf-8")
+
+    def write(self, record: MetricRecord) -> None:
+        line = json.dumps(
+            {
+                "run_id": record.run_id,
+                "step": record.step,
+                "timestamp": record.timestamp,
+                "metrics": dict(record.metrics),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        self.stream.write(line + "\n")
+        self.flush()
+
+    def flush(self) -> None:
+        if not self.stream.closed:
+            self.stream.flush()
+
+    def close(self) -> None:
+        self.stream.close()
+
+
+class CSVSink:
+    """Append one row per scalar, allowing training and evaluation keys to differ.
+
+    Replayed steps on resume remain in the raw history, identified by run/step/time.
+    """
+
+    columns = ("run_id", "step", "timestamp", "metric", "value")
+
+    def __init__(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        has_header = path.exists() and path.stat().st_size > 0
+        if has_header:
+            with path.open(encoding="utf-8", newline="") as existing:
+                if next(csv.reader(existing), None) != list(self.columns):
+                    raise ValueError(f"Incompatible metrics CSV header: {path}")
+        self.stream = path.open("a", encoding="utf-8", newline="")
+        self.writer = csv.writer(self.stream)
+        if not has_header:
+            self.writer.writerow(self.columns)
+            self.flush()
+
+    def write(self, record: MetricRecord) -> None:
+        self.writer.writerows(
+            (record.run_id, record.step, record.timestamp, name, value)
+            for name, value in record.metrics.items()
+        )
+        self.flush()
+
+    def flush(self) -> None:
+        if not self.stream.closed:
+            self.stream.flush()
+
+    def close(self) -> None:
+        self.stream.close()
 
 
 class TensorBoardSink:
