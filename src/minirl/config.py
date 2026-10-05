@@ -1,11 +1,45 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 
 def _positive_integer(name: str, value: int, *, allow_zero: bool = False) -> None:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
+@dataclass
+class MuonConfig:
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
+    adjust_lr_fn: Literal["original", "match_rms_adamw", "spectral_unclamped"] = (
+        "match_rms_adamw"
+    )
+    # None shares TrainerConfig.learning_rate with the Muon parameter group.
+    adamw_lr: float | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.momentum, bool) or not 0 <= self.momentum < 1:
+            raise ValueError("muon.momentum must be in [0, 1)")
+        if type(self.nesterov) is not bool:
+            raise ValueError("muon.nesterov must be a boolean")
+        _positive_integer("muon.ns_steps", self.ns_steps)
+        if self.ns_steps >= 100:
+            raise ValueError("muon.ns_steps must be smaller than 100")
+        if self.adjust_lr_fn not in (
+            "original",
+            "match_rms_adamw",
+            "spectral_unclamped",
+        ):
+            raise ValueError("Unsupported muon.adjust_lr_fn")
+        if self.adamw_lr is not None and (
+            isinstance(self.adamw_lr, bool)
+            or not math.isfinite(self.adamw_lr)
+            or self.adamw_lr < 0
+        ):
+            raise ValueError("muon.adamw_lr must be finite and non-negative")
 
 
 @dataclass
@@ -21,8 +55,14 @@ class TrainerConfig:
     save_steps: int = 0
     seed: int = 42
     device: str | None = None
+    optimizer: Literal["adamw", "muon"] = field(default="adamw", kw_only=True)
+    muon: MuonConfig = field(default_factory=MuonConfig, kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.optimizer not in ("adamw", "muon"):
+            raise ValueError("optimizer must be 'adamw' or 'muon'")
+        if not isinstance(self.muon, MuonConfig):
+            raise TypeError("muon must be a MuonConfig")
         for name in ("learning_rate", "weight_decay", "max_grad_norm"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:

@@ -15,7 +15,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
-from torch.optim import AdamW, Optimizer
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 
@@ -23,8 +23,8 @@ from .algorithm import SFT
 from .algorithm.base import Algorithm, TensorBatch
 from .common import DataCollector, MetricValue
 from .common.training_metrics import TrainingMetrics
-from .config import SFTConfig, TrainerConfig
-from .optim import MasterAdamW
+from .config import MuonConfig, SFTConfig, TrainerConfig
+from .optim import build_optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +146,7 @@ class Trainer:
                 parameter.grad = None
         self.models[name] = model
         if trainable:
-            optimizer_type = (
-                MasterAdamW
-                if any(p.dtype in (torch.bfloat16, torch.float16) for p in parameters)
-                else AdamW
-            )
-            self.optimizers[name] = optimizer_type(
-                parameters,
-                lr=lr if lr is not None else self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
+            self.optimizers[name] = build_optimizer(model, self.config, lr=lr)
         return model
 
     def register_scheduler(self, name: str, total_steps: int) -> None:
@@ -278,9 +269,13 @@ class Trainer:
             raise ValueError("Checkpoint trainer type differs")
         ignored = {"output_dir", "device", "log_steps", "save_steps"}
         current_config = asdict(self.config)
+        saved_config = dict(state["config"])
+        # Checkpoints written before optimizer selection always used AdamW.
+        saved_config.setdefault("optimizer", "adamw")
+        saved_config.setdefault("muon", asdict(MuonConfig()))
         changed = [
             key
-            for key, value in state["config"].items()
+            for key, value in saved_config.items()
             if key not in ignored and current_config.get(key) != value
         ]
         if changed:
