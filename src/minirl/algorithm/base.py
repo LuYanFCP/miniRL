@@ -32,6 +32,10 @@ class Algorithm(ABC):
         """
         return batch
 
+    def rollout_metrics(self) -> Mapping[str, float]:
+        """Return statistics for the prepared rollout, reused for its updates."""
+        return {}
+
     @abstractmethod
     def compute_losses(self, models: ModelMap, batch: TensorBatch) -> Losses:
         """Return scalar losses keyed by trainable model name, including SFT.
